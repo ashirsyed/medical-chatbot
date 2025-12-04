@@ -25,8 +25,16 @@ if not SECRET_KEY:
 app.secret_key = SECRET_KEY
 
 # Configure Flask-Session for filesystem storage (works with Gunicorn workers)
-SESSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'flask_sessions')
+# Use /tmp for sessions to avoid permission issues (or use absolute path in user's home)
+SESSION_DIR = os.path.join(os.path.expanduser('~'), '.flask_sessions')
+# Alternative: Use /tmp (but sessions won't persist across reboots)
+# SESSION_DIR = '/tmp/flask_sessions'
 os.makedirs(SESSION_DIR, exist_ok=True)
+# Ensure the directory is writable
+try:
+    os.chmod(SESSION_DIR, 0o755)
+except Exception as e:
+    pass  # Will log warning after logger is initialized
 
 app.config['SESSION_TYPE'] = 'filesystem'
 app.config['SESSION_FILE_DIR'] = SESSION_DIR
@@ -39,6 +47,11 @@ Session(app)
 
 # Initialize logger after app is created
 logger = get_logger(__name__)
+logger.info(f"Session directory: {SESSION_DIR}")
+# Check if session directory is writable
+if not os.access(SESSION_DIR, os.W_OK):
+    logger.warning(f"Session directory {SESSION_DIR} is not writable! This will cause session errors.")
+    logger.warning("Fix with: chmod 755 " + SESSION_DIR + " or chown to current user")
 if os.environ.get("FLASK_SECRET_KEY"):
     logger.info("Flask application initialized with filesystem session storage (secret key from environment)")
 else:
@@ -60,46 +73,63 @@ def index():
 
     if request.method=="POST":
         user_input = request.form.get("prompt")
+        logger.info(f"POST request received. User input: {user_input[:100] if user_input else 'None'}")
 
         if user_input:
             try:
                 # Get current messages from session
                 messages = list(session.get("messages", []))
+                logger.info(f"Current session has {len(messages)} messages")
                 
                 # Add user message
                 messages.append({"role" : "user" , "content":user_input})
                 session["messages"] = messages
                 session.modified = True  # Explicitly mark session as modified
+                logger.info(f"Added user message to session. Total messages: {len(messages)}")
                 
                 logger.info(f"Processing question: {user_input[:50]}...")
                 
                 # Create QA chain and get response
+                logger.info("Creating QA chain...")
                 qa_chain = create_qa_chain()
                 if qa_chain is None:
                     raise Exception("QA chain could not be created (LLM or VectorStore issue)")
                 
-                response = qa_chain.invoke({"query" : user_input})
+                logger.info(f"Invoking QA chain with query: '{user_input}'")
+                # Ensure query is passed correctly
+                if not user_input or not user_input.strip():
+                    raise Exception("Query is empty")
+                response = qa_chain.invoke({"query" : user_input.strip()})
                 result = response.get("result" , "No response")
+                if not result or result.strip() == "":
+                    result = "No response generated"
                 
-                logger.info(f"Got response: {result[:50] if result else 'No response'}...")
+                logger.info(f"Got response: {result[:100] if result else 'No response'}...")
 
                 # Add assistant response
                 messages.append({"role" : "assistant" , "content" : result})
                 session["messages"] = messages
                 session.modified = True  # Explicitly mark session as modified
+                logger.info(f"Added assistant response. Total messages: {len(messages)}")
                 
             except Exception as e:
-                logger.error(f"Error processing question: {str(e)}", exc_info=True)
+                logger.error(f"ERROR processing question: {str(e)}", exc_info=True)
+                import traceback
+                logger.error(f"Full traceback: {traceback.format_exc()}")
                 error_msg = f"Error: {str(e)}"
                 # Preserve existing messages even on error
                 messages = list(session.get("messages", []))
+                logger.error(f"Returning error page with {len(messages)} messages")
                 return render_template("index.html" , messages=messages , error = error_msg)
+        else:
+            logger.warning("POST request received but user_input is empty")
             
+        logger.info("Redirecting to index...")
         return redirect(url_for("index"))
     
     # GET request - display messages
     messages = session.get("messages", [])
-    logger.debug(f"Displaying {len(messages)} messages")
+    logger.info(f"GET request - Displaying {len(messages)} messages in session")
     return render_template("index.html" , messages=messages)
 
 @app.route("/clear")
